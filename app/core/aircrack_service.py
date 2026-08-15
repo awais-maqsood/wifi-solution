@@ -191,7 +191,7 @@ class AircrackService:
                 need_install = True
                 notes.append(
                     f"Module '{profile.good_module}' not loaded — installing "
-                    f"{profile.install_label}…"
+                    f"{profile.install_label} (git/apt DKMS)…"
                 )
         elif probe["has_usb"] and not probe["has_iface"]:
             notes.append(

@@ -21,7 +21,9 @@ class DriverServiceTests(unittest.TestCase):
         self.assertIsNotNone(prof)
         assert prof is not None
         self.assertEqual(prof.id, "rtl8188eus")
-        self.assertEqual(prof.apt_package, "realtek-rtl8188eus-dkms")
+        self.assertEqual(prof.good_module, "8188eu")
+        self.assertEqual(prof.install_method, "git_dkms")
+        self.assertIn("aircrack-ng/rtl8188eus", prof.git_url)
 
     def test_rtl8192eu_tplink_wn823n(self) -> None:
         svc = DriverService()

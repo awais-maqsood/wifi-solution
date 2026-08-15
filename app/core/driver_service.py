@@ -113,15 +113,15 @@ PROFILES: list[DriverProfile] = [
         bad_modules=["rtl8xxxu", "r8188eu"],
         good_module="8188eu",
         apt_package="realtek-rtl8188eus-dkms",
+        # Prefer git: Kali apt package is in contrib and often missing / headers mismatch
+        install_method="git_dkms",
         blacklist_modules=["r8188eu", "rtl8xxxu"],
-        # apt first; git fallback if package missing / contrib not enabled
         git_url="https://github.com/aircrack-ng/rtl8188eus.git",
-        dkms_name="rtl8188eus",
-        dkms_version="5.3.9",
+        dkms_name="realtek-rtl8188eus",
+        dkms_version="5.7.6.1~20200205",
         notes=(
-            "Stock rtl8xxxu often reports monitor mode but captures 0 APs. "
-            "Install realtek-rtl8188eus-dkms (Kali contrib) or git DKMS, "
-            "blacklist rtl8xxxu, then unplug/replug."
+            "Install via aircrack-ng/rtl8188eus DKMS (module 8188eu). "
+            "Blacklist rtl8xxxu. Unplug/replug after install."
         ),
     ),
     DriverProfile(
@@ -559,16 +559,7 @@ class DriverService:
         def _run() -> None:
             code = 1
             try:
-                if profile.install_method == "git_dkms":
-                    code = self._install_git_dkms(profile, on_line=on_line)
-                else:
-                    code = self._install_apt(profile, on_line=on_line)
-                    if code != 0 and profile.git_url:
-                        self._emit(
-                            "apt install failed — trying git DKMS fallback "
-                            f"({profile.git_url})…"
-                        )
-                        code = self._install_git_dkms(profile, on_line=on_line)
+                code = self._install_best(profile, on_line=on_line)
                 if code == 0:
                     self.ensure_blacklist(profile.blacklist_modules)
                     self.reload_modules(profile)
@@ -606,13 +597,7 @@ class DriverService:
         self._installing = True
         code = 1
         try:
-            if profile.install_method == "git_dkms":
-                code = self._install_git_dkms(profile, on_line=on_line)
-            else:
-                code = self._install_apt(profile, on_line=on_line)
-                if code != 0 and profile.git_url:
-                    self._emit("apt install failed — trying git DKMS fallback…")
-                    code = self._install_git_dkms(profile, on_line=on_line)
+            code = self._install_best(profile, on_line=on_line)
             if code == 0:
                 self.ensure_blacklist(profile.blacklist_modules)
                 self.reload_modules(profile)
@@ -625,6 +610,32 @@ class DriverService:
             code = 1
         finally:
             self._installing = False
+        return code
+
+    def _install_best(
+        self, profile: DriverProfile, *, on_line: Optional[OnLine]
+    ) -> int:
+        """Try preferred method, then the other if both apt + git are configured."""
+        prefer_git = profile.install_method == "git_dkms" and bool(profile.git_url)
+        if prefer_git:
+            self._emit(f"Installing via git DKMS: {profile.git_url}")
+            code = self._install_git_dkms(profile, on_line=on_line)
+            if code == 0:
+                return 0
+            if profile.apt_package:
+                self._emit("git DKMS failed — trying apt package…")
+                return self._install_apt(profile, on_line=on_line)
+            return code
+
+        code = self._install_apt(profile, on_line=on_line)
+        if code == 0:
+            return 0
+        if profile.git_url:
+            self._emit(
+                f"apt install failed ({code}) — trying git DKMS "
+                f"({profile.git_url})…"
+            )
+            return self._install_git_dkms(profile, on_line=on_line)
         return code
 
     def profile_for_usb_blob(self, blob: str) -> Optional[DriverProfile]:
@@ -670,11 +681,50 @@ class DriverService:
     def _install_apt(
         self, profile: DriverProfile, *, on_line: Optional[OnLine]
     ) -> int:
-        kernel = os.uname().release
         # Package may live in Kali contrib — make sure apt can see it
         self._ensure_package_visible(profile.apt_package, on_line=on_line)
-        cmds = [
-            ["apt-get", "update"],
+        self._apt_update_soft(on_line=on_line)
+        code = self._install_build_deps(on_line=on_line)
+        if code != 0:
+            return code
+        code = self._run_logged(
+            ["apt-get", "install", "-y", profile.apt_package],
+            on_line=on_line,
+        )
+        if code != 0:
+            self._emit(f"Command failed ({code}): apt-get install {profile.apt_package}")
+            self._emit(
+                "Hint: enable Kali contrib (main contrib non-free non-free-firmware)."
+            )
+        return code
+
+    def _apt_update_soft(self, *, on_line: Optional[OnLine]) -> None:
+        code = self._run_logged(["apt-get", "update"], on_line=on_line)
+        if code != 0:
+            self._emit(f"apt-get update failed ({code}) — continuing with cache")
+
+    def _install_build_deps(self, *, on_line: Optional[OnLine]) -> int:
+        kernel = os.uname().release
+        # Exact headers often missing after a kernel upgrade; also try metapackage
+        pkgs = [
+            "dkms",
+            "build-essential",
+            "git",
+            "bc",
+            f"linux-headers-{kernel}",
+            "linux-headers-amd64",
+        ]
+        code = self._run_logged(
+            ["apt-get", "install", "-y", *pkgs],
+            on_line=on_line,
+        )
+        if code == 0:
+            return 0
+        self._emit(
+            f"Full headers install failed ({code}); retrying without exact "
+            f"linux-headers-{kernel}…"
+        )
+        return self._run_logged(
             [
                 "apt-get",
                 "install",
@@ -682,47 +732,77 @@ class DriverService:
                 "dkms",
                 "build-essential",
                 "git",
-                f"linux-headers-{kernel}",
-                profile.apt_package,
+                "bc",
+                "linux-headers-amd64",
             ],
-        ]
-        for cmd in cmds:
-            code = self._run_logged(cmd, on_line=on_line)
-            if code != 0:
-                self._emit(f"Command failed ({code}): {' '.join(cmd)}")
-                if profile.apt_package in " ".join(cmd):
-                    self._emit(
-                        "Hint: enable Kali contrib in /etc/apt/sources.list "
-                        "(main contrib non-free non-free-firmware), then retry — "
-                        "or the app will try git DKMS next."
-                    )
-                return code
-        return 0
+            on_line=on_line,
+        )
+
+    def _package_candidate_available(self, package: str) -> bool:
+        if not package:
+            return False
+        code, out = self._helper.run_capture(
+            ["apt-cache", "policy", package], timeout=15
+        )
+        if code != 0 or not out:
+            return False
+        # Look at Candidate line specifically
+        for line in out.splitlines():
+            if line.strip().startswith("Candidate:"):
+                cand = line.split(":", 1)[-1].strip()
+                return bool(cand) and cand != "(none)"
+        return False
 
     def _ensure_package_visible(
         self, package: str, *, on_line: Optional[OnLine]
     ) -> None:
         if not package:
             return
-        code, out = self._helper.run_capture(
-            ["apt-cache", "policy", package], timeout=15
-        )
-        text = out or ""
-        if code == 0 and "Candidate:" in text and "(none)" not in text.split("Candidate:")[-1][:40]:
+        if self._package_candidate_available(package):
             return
         self._emit(
-            f"Package '{package}' not visible to apt — checking sources for contrib…"
+            f"Package '{package}' not visible to apt — enabling contrib in apt sources…"
         )
-        sources = Path("/etc/apt/sources.list")
-        try:
-            raw = sources.read_text(encoding="utf-8", errors="replace") if sources.exists() else ""
-        except OSError:
-            return
+        source_files: list[Path] = []
+        main = Path("/etc/apt/sources.list")
+        if main.exists():
+            source_files.append(main)
+        d = Path("/etc/apt/sources.list.d")
+        if d.is_dir():
+            source_files.extend(sorted(d.glob("*.list")))
+            source_files.extend(sorted(d.glob("*.sources")))
+
+        changed_any = False
+        for sources in source_files:
+            try:
+                raw = sources.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            new_raw, changed = self._inject_contrib(raw)
+            if not changed:
+                continue
+            try:
+                sources.write_text(new_raw, encoding="utf-8")
+                self._emit(f"Updated {sources} to include contrib/non-free")
+                if on_line:
+                    on_line(f"Updated {sources} to include contrib/non-free")
+                changed_any = True
+            except OSError as exc:
+                self._emit(f"Could not update {sources}: {exc}")
+        if not changed_any:
+            self._emit(
+                "Could not auto-enable contrib. Edit apt sources to include: "
+                "main contrib non-free non-free-firmware"
+            )
+
+    @staticmethod
+    def _inject_contrib(raw: str) -> tuple[str, bool]:
         changed = False
         lines = raw.splitlines()
         new_lines: list[str] = []
         for line in lines:
             stripped = line.strip()
+            # Classic one-line deb entries
             if stripped.startswith("deb ") and "kali" in stripped.lower():
                 if "contrib" not in stripped:
                     line = line.rstrip() + " contrib"
@@ -730,41 +810,36 @@ class DriverService:
                 if "non-free" not in stripped:
                     line = line.rstrip() + " non-free non-free-firmware"
                     changed = True
+            # deb822 .sources files
+            elif stripped.lower().startswith("components:"):
+                lower = stripped.lower()
+                if "contrib" not in lower or "non-free" not in lower:
+                    comps = stripped.split(":", 1)[-1].strip().split()
+                    for c in ("main", "contrib", "non-free", "non-free-firmware"):
+                        if c not in comps:
+                            comps.append(c)
+                            changed = True
+                    line = "Components: " + " ".join(comps)
             new_lines.append(line)
-        if changed:
-            try:
-                sources.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-                self._emit(f"Updated {sources} to include contrib/non-free")
-                if on_line:
-                    on_line(f"Updated {sources} to include contrib/non-free")
-            except OSError as exc:
-                self._emit(f"Could not update sources.list: {exc}")
+        if not changed:
+            return raw, False
+        return "\n".join(new_lines) + "\n", True
 
     def _install_git_dkms(
         self, profile: DriverProfile, *, on_line: Optional[OnLine]
     ) -> int:
-        kernel = os.uname().release
         name = profile.dkms_name or profile.id
         ver = profile.dkms_version or "1.0"
         src = self.BUILD_DIR / name
 
-        prep = [
-            ["apt-get", "update"],
-            [
-                "apt-get",
-                "install",
-                "-y",
-                "dkms",
-                "build-essential",
-                "git",
-                f"linux-headers-{kernel}",
-            ],
-        ]
-        for cmd in prep:
-            code = self._run_logged(cmd, on_line=on_line)
-            if code != 0:
-                self._emit(f"Command failed ({code}): {' '.join(cmd)}")
-                return code
+        self._apt_update_soft(on_line=on_line)
+        code = self._install_build_deps(on_line=on_line)
+        if code != 0:
+            self._emit(
+                "Cannot install build deps / kernel headers. "
+                "Try: apt install dkms build-essential git linux-headers-amd64"
+            )
+            return code
 
         self.BUILD_DIR.mkdir(parents=True, exist_ok=True)
         if src.exists():
@@ -777,15 +852,21 @@ class DriverService:
         if code != 0:
             return code
 
+        # Prefer names from upstream dkms.conf when present
+        name, ver = self._read_dkms_identity(src, name, ver)
+        self._emit(f"DKMS identity: {name}/{ver}")
+
         # Realtek out-of-tree drivers often ship with monitor disabled
         self._enable_wifi_monitor_flag(src)
 
         # Prefer upstream install script when present
-        for script in ("install.sh", "dkms-install.sh", "install_wifi.sh"):
+        for script in ("dkms-install.sh", "install.sh", "install_wifi.sh"):
             path = src / script
             if path.exists():
                 path.chmod(path.stat().st_mode | 0o111)
-                code = self._run_logged(["bash", str(path)], on_line=on_line, cwd=str(src))
+                code = self._run_logged(
+                    ["bash", str(path)], on_line=on_line, cwd=str(src)
+                )
                 if code == 0:
                     return 0
                 self._emit(f"{script} failed ({code}); trying manual dkms…")
@@ -807,6 +888,26 @@ class DriverService:
             if code != 0:
                 return code
         return 0
+
+    @staticmethod
+    def _read_dkms_identity(
+        src: Path, default_name: str, default_ver: str
+    ) -> tuple[str, str]:
+        conf = src / "dkms.conf"
+        name, ver = default_name, default_ver
+        if not conf.exists():
+            return name, ver
+        try:
+            text = conf.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return name, ver
+        m = re.search(r'PACKAGE_NAME\s*=\s*"([^"]+)"', text)
+        if m:
+            name = m.group(1)
+        m = re.search(r'PACKAGE_VERSION\s*=\s*"([^"]+)"', text)
+        if m:
+            ver = m.group(1)
+        return name, ver
 
     def _enable_wifi_monitor_flag(self, src: Path) -> None:
         """Force CONFIG_WIFI_MONITOR=y so iwconfig mode monitor works."""
