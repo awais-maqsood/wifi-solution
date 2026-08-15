@@ -48,7 +48,17 @@ class InterfacePage(PageBase):
             command=lambda: app.goto_step(0),
         ).pack(side="left", padx=(0, 8))
         self.status = ctk.CTkLabel(btn_row, text="", text_color="gray70")
-        self.status.pack(side="left")
+        self.status.pack(side="left", padx=(8, 0))
+
+        # Always-visible continue (list used to push the bottom button off-screen)
+        self.btn_continue = ctk.CTkButton(
+            btn_row,
+            text="Use selected → Monitor",
+            width=180,
+            command=self.use_selected,
+            state="disabled",
+        )
+        self.btn_continue.pack(side="right")
 
         self.hint = ctk.CTkLabel(
             self,
@@ -59,16 +69,31 @@ class InterfacePage(PageBase):
         )
         self.hint.pack(anchor="w", pady=(0, 8))
 
-        self.listbox = ctk.CTkScrollableFrame(self, height=220)
+        # Pin footer first so the scrollable list cannot hide it
+        action = ctk.CTkFrame(self, fg_color="transparent")
+        action.pack(side="bottom", fill="x", pady=(8, 0))
+        ctk.CTkButton(
+            action,
+            text="Use selected → Monitor",
+            width=200,
+            command=self.use_selected,
+        ).pack(side="right")
+        ctk.CTkLabel(
+            action,
+            text="Or click 3. Monitor in the sidebar after selecting wlan0.",
+            text_color="gray60",
+        ).pack(side="left")
+
+        self.listbox = ctk.CTkScrollableFrame(self, height=160)
         self.listbox.pack(fill="both", expand=True, pady=(8, 8))
 
         self._selected = ctk.StringVar(value="")
+        self._selected.trace_add("write", self._on_selection_change)
 
-        action = ctk.CTkFrame(self, fg_color="transparent")
-        action.pack(fill="x", pady=(8, 0))
-        ctk.CTkButton(
-            action, text="Use selected →", command=self.use_selected
-        ).pack(side="right")
+    def _on_selection_change(self, *_args: Any) -> None:
+        name = self._selected.get().strip()
+        state = "normal" if name and not name.startswith("(") else "disabled"
+        self.btn_continue.configure(state=state)
 
     def on_show(self) -> None:
         self.refresh()
@@ -98,14 +123,20 @@ class InterfacePage(PageBase):
                     text=name,
                     variable=self._selected,
                     value=name,
+                    command=self._on_selection_change,
                 )
                 rb.pack(side="left", padx=12, pady=10)
+                # Double-click row to continue
+                row.bind("<Double-Button-1>", lambda _e, n=name: self._select_and_go(n))
+                rb.bind("<Double-Button-1>", lambda _e, n=name: self._select_and_go(n))
                 if name == current or (not current and not self._selected.get()):
                     self._selected.set(name)
+            self._on_selection_change()
             return
 
         # No iface — explain USB vs network interface clearly
         self.status.configure(text="No wireless interfaces found")
+        self.btn_continue.configure(state="disabled")
         if probe["has_usb"]:
             usb_short = "; ".join(probe["usb"][:2])
             mods = ", ".join(probe["modules"]) or "none of 8188eu/8192eu loaded"
@@ -113,7 +144,7 @@ class InterfacePage(PageBase):
                 f"USB Wi-Fi is plugged in ({usb_short}), but Linux has not created "
                 f"a network interface (wlan0) yet. Loaded modules: {mods}. "
                 "Click Fix adapter (install driver) — this installs "
-                "realtek-rtl8188eus-dkms / git DKMS, blacklists rtl8xxxu, and rebinds USB."
+                "git DKMS (aircrack-ng/rtl8188eus), blacklists rtl8xxxu, and rebinds USB."
             )
             self.hint.configure(text=msg)
             self.app.log(
@@ -139,6 +170,10 @@ class InterfacePage(PageBase):
             )
             self.app.log("No wireless USB devices and no wlan interfaces found.")
 
+    def _select_and_go(self, name: str) -> None:
+        self._selected.set(name)
+        self.use_selected()
+
     def bring_up(self) -> None:
         self.status.configure(text="Installing driver / bringing up…")
         self.app.log(
@@ -160,8 +195,8 @@ class InterfacePage(PageBase):
 
     def use_selected(self) -> None:
         name = self._selected.get().strip()
-        if not name:
-            self.app.log("Select an interface first.")
+        if not name or name.startswith("("):
+            self.app.log("Select an interface first (e.g. wlan0).")
             return
         self.app.session.interface = name
         # If user picked a monitor iface, keep it as monitor
