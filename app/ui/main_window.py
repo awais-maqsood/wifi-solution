@@ -66,17 +66,33 @@ class MainWindow(ctk.CTk):
             anchor="w",
             font=ctk.CTkFont(size=13, weight="bold"),
         )
-        self.root_banner.grid(row=0, column=0, sticky="ew")
+        self.root_banner.grid(row=0, column=0, columnspan=2, sticky="ew")
+
+        tool_row = ctk.CTkFrame(top, fg_color="transparent")
+        tool_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        tool_row.grid_columnconfigure(0, weight=1)
 
         self.tool_banner = ctk.CTkLabel(
-            top,
+            tool_row,
             text="",
             anchor="w",
             text_color="#c04040",
-            wraplength=900,
+            wraplength=780,
             justify="left",
         )
-        self.tool_banner.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        self.tool_banner.grid(row=0, column=0, sticky="ew")
+
+        self.btn_install_tools = ctk.CTkButton(
+            tool_row,
+            text="Install aircrack-ng",
+            width=160,
+            fg_color="#8B3A3A",
+            hover_color="#6e2e2e",
+            command=self._install_aircrack_tools,
+        )
+        # Hidden until missing tools are detected
+        self.btn_install_tools.grid(row=0, column=1, padx=(8, 0))
+        self.btn_install_tools.grid_remove()
 
         # Left nav
         nav = ctk.CTkFrame(self, width=190, corner_radius=8)
@@ -176,12 +192,52 @@ class MainWindow(ctk.CTk):
             )
             self.log("Warning: not root. airmon-ng / injection will likely fail.")
 
-        hint = self.service.tool_hint()
-        if hint:
-            self.tool_banner.configure(text=hint)
-            self.log(hint)
+        missing = self.service.missing_binaries()
+        if missing:
+            self.tool_banner.configure(
+                text="Missing tools: " + ", ".join(missing),
+                text_color="#c04040",
+            )
+            self.btn_install_tools.grid()
+            self.btn_install_tools.configure(state="normal", text="Install aircrack-ng")
+            self.log("Missing tools: " + ", ".join(missing))
         else:
-            self.tool_banner.configure(text="aircrack-ng tools found on PATH")
+            self.tool_banner.configure(
+                text="aircrack-ng tools found on PATH",
+                text_color="#3cb371",
+            )
+            self.btn_install_tools.grid_remove()
+
+    def _install_aircrack_tools(self) -> None:
+        if self.service.installing_tools:
+            self.log("Install already in progress…")
+            return
+        if not self.service.is_root():
+            self.log("Root required. Re-launch with: sudo python3 main.py")
+            self.tool_banner.configure(
+                text="Root required to install — run with sudo",
+                text_color="#c9a227",
+            )
+            return
+
+        self.btn_install_tools.configure(state="disabled", text="Installing…")
+        self.tool_banner.configure(
+            text="Installing aircrack-ng via apt… (see log)",
+            text_color="#c9a227",
+        )
+        self.log("Installing aircrack-ng…")
+
+        def _done(code: int) -> None:
+            self.after(0, self._install_aircrack_done, code)
+
+        self.service.install_aircrack(on_done=_done)
+
+    def _install_aircrack_done(self, code: int) -> None:
+        if code == 0:
+            self.set_status("aircrack-ng installed")
+        else:
+            self.set_status(f"aircrack-ng install failed (exit {code})")
+        self._check_environment()
 
     # ----------------------------------------------------------------- nav
     def goto_step(self, index: int) -> None:

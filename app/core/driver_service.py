@@ -454,14 +454,22 @@ class DriverService:
             parts = re.split(r"\t+|\s{2,}", line.strip())
             if len(parts) < 3:
                 continue
-            if not parts[0].lower().startswith("phy"):
+            phy = parts[0].strip()
+            if not phy.lower().startswith("phy"):
+                continue
+            # airmon-ng header: "PHY  Interface  Driver  Chipset"
+            if phy.upper() == "PHY" or parts[1].strip().lower() == "interface":
+                continue
+            iface = parts[1].strip() if len(parts) > 1 else ""
+            driver = parts[2].strip() if len(parts) > 2 else ""
+            if not iface or iface.lower() in ("interface", "driver", "chipset"):
                 continue
             rows.append(
                 {
-                    "phy": parts[0],
-                    "iface": parts[1] if len(parts) > 1 else "",
-                    "driver": parts[2] if len(parts) > 2 else "",
-                    "chipset": " ".join(parts[3:]) if len(parts) > 3 else "",
+                    "phy": phy,
+                    "iface": iface,
+                    "driver": driver,
+                    "chipset": " ".join(parts[3:]).strip() if len(parts) > 3 else "",
                 }
             )
         return rows

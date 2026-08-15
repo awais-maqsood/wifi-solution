@@ -51,6 +51,26 @@ class DriverServiceTests(unittest.TestCase):
         assert prof is not None
         self.assertEqual(prof.good_module, "8188eu")
 
+    def test_parse_airmon_skips_header(self) -> None:
+        svc = DriverService()
+        text = """
+Found 2 processes that could cause trouble.
+
+PHY	Interface	Driver		Chipset
+
+phy0	wlan0		rtl8xxxu	Realtek Semiconductor Corp. RTL8188EUS
+"""
+        rows = svc._parse_airmon_table(text)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["iface"], "wlan0")
+        self.assertEqual(rows[0]["driver"], "rtl8xxxu")
+        self.assertNotIn("Interface", [r["iface"] for r in rows])
+
+    def test_parse_airmon_skips_phy_only_header(self) -> None:
+        svc = DriverService()
+        rows = svc._parse_airmon_table("PHY  Interface  Driver  Chipset")
+        self.assertEqual(rows, [])
+
     def test_profiles_have_install_path(self) -> None:
         for p in PROFILES:
             self.assertTrue(p.good_module)

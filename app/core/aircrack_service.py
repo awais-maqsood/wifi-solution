@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 import threading
 import time
 from collections.abc import Callable
@@ -49,6 +50,7 @@ class AircrackService:
         self._scan_prefix: Optional[Path] = None
         self._capture_prefix: Optional[Path] = None
         self._handshake_stop_scheduled = False
+        self._installing_tools = False
 
     # ------------------------------------------------------------------ utils
     def missing_binaries(self) -> list[str]:
@@ -762,8 +764,64 @@ class AircrackService:
         missing = self.missing_binaries()
         if not missing:
             return ""
-        return (
-            "Missing tools: "
-            + ", ".join(missing)
-            + "\nInstall with: sudo apt install aircrack-ng"
-        )
+        return "Missing tools: " + ", ".join(missing)
+
+    def install_aircrack(
+        self,
+        *,
+        on_line: Optional[OnLine] = None,
+        on_done: Optional[OnDone] = None,
+    ) -> None:
+        """Install aircrack-ng via apt (requires root). Runs in a background thread."""
+        if self._installing_tools:
+            self._emit("aircrack-ng install already running.")
+            return
+        if not self.is_root():
+            self._emit("Root required to install aircrack-ng. Run via sudo ./run.sh")
+            if on_done:
+                on_done(1)
+            return
+
+        self._installing_tools = True
+
+        def _run() -> None:
+            code = 1
+            try:
+                cmds = [
+                    ["apt-get", "update"],
+                    ["apt-get", "install", "-y", "aircrack-ng"],
+                ]
+                for cmd in cmds:
+                    self._emit("Running: " + " ".join(cmd))
+                    proc = subprocess.run(cmd, capture_output=True, text=True)
+                    out = (proc.stdout or "") + (proc.stderr or "")
+                    for line in out.splitlines():
+                        msg = line.rstrip()
+                        if msg:
+                            self._emit(msg)
+                            if on_line:
+                                on_line(msg)
+                    if proc.returncode != 0:
+                        self._emit(f"Command failed ({proc.returncode}): {' '.join(cmd)}")
+                        code = proc.returncode
+                        return
+                missing = self.missing_binaries()
+                if missing:
+                    self._emit("Install finished but still missing: " + ", ".join(missing))
+                    code = 1
+                else:
+                    self._emit("aircrack-ng tools installed successfully.")
+                    code = 0
+            except Exception as exc:
+                self._emit(f"Install error: {exc}")
+                code = 1
+            finally:
+                self._installing_tools = False
+                if on_done:
+                    on_done(code)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    @property
+    def installing_tools(self) -> bool:
+        return self._installing_tools

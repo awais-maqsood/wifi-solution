@@ -25,17 +25,17 @@ class DriversPage(PageBase):
             font=ctk.CTkFont(size=20, weight="bold"),
         ).pack(anchor="w", pady=(0, 8))
 
-        ctk.CTkLabel(
+        self.hint = ctk.CTkLabel(
             self,
             text=(
                 "Lists every wireless USB adapter (any brand). "
-                "Known chipsets get a one-click install (apt DKMS or git DKMS). "
-                "Your TL-WN823N (RTL8192EU) needs the 8192eu DKMS driver."
+                "Known chipsets get a one-click install (apt DKMS or git DKMS)."
             ),
             text_color="gray70",
             wraplength=640,
             justify="left",
-        ).pack(anchor="w", pady=(0, 12))
+        )
+        self.hint.pack(anchor="w", pady=(0, 12))
 
         btn_row = ctk.CTkFrame(self, fg_color="transparent")
         btn_row.pack(fill="x", pady=(0, 8))
@@ -121,6 +121,7 @@ class DriversPage(PageBase):
         assert report is not None
         self._report = report
         self._fill_table(report)
+        self._update_hint(report)
         needs = [a for a in report.adapters if a.status == "needs_driver"]
         if needs:
             self.status.configure(
@@ -149,6 +150,32 @@ class DriversPage(PageBase):
             )
             or report.lsusb[:500],
         )
+
+    def _update_hint(self, report: DriverReport) -> None:
+        base = (
+            "Lists every wireless USB adapter (any brand). "
+            "Known chipsets get a one-click install (apt DKMS or git DKMS)."
+        )
+        tips: list[str] = []
+        seen: set[str] = set()
+        for ad in report.adapters:
+            if not ad.profile or ad.profile.id in seen:
+                continue
+            if ad.status != "needs_driver":
+                continue
+            seen.add(ad.profile.id)
+            label = ad.profile.label.split("(")[0].strip()
+            install = ad.profile.install_label
+            if ad.iface.startswith("(") or not ad.iface:
+                tips.append(
+                    f"Detected {label} ({ad.usb_ids or 'USB'}) — no network iface yet; "
+                    f"install {install}, then unplug/replug."
+                )
+            else:
+                tips.append(f"Detected {label} — install {install}.")
+        if not report.adapters:
+            tips.append("No wireless USB adapters found. Plug in a Wi-Fi dongle and Verify.")
+        self.hint.configure(text=base + (" " + " ".join(tips) if tips else ""))
 
     def _fill_table(self, report: DriverReport) -> None:
         for item in self.tree.get_children():
@@ -236,8 +263,8 @@ class DriversPage(PageBase):
             self.app.log("Install already in progress…")
             return
         self.btn_install.configure(state="disabled")
-        self.status.configure(text=f"Installing {prof.apt_package}… (see log)")
-        self.app.log(f"Installing driver package: {prof.apt_package}")
+        self.status.configure(text=f"Installing {prof.install_label}… (see log)")
+        self.app.log(f"Installing driver: {prof.install_label}")
 
         def _done(code: int) -> None:
             self.ui(self._install_done, code)
