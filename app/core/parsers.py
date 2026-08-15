@@ -29,7 +29,7 @@ AIRMON_DISABLED_RE = re.compile(
     re.IGNORECASE,
 )
 IW_DEV_BLOCK_RE = re.compile(
-    r"Interface\s+(\S+)(.*?)(?=\nInterface\s+|\Z)",
+    r"(?:^|\n)[ \t]*Interface\s+(\S+)(.*?)(?=(?:\n[ \t]*Interface\s+)|\Z)",
     re.IGNORECASE | re.DOTALL,
 )
 ANSI_ESCAPE_RE = re.compile(
@@ -53,6 +53,17 @@ def parse_wireless_interfaces(iwconfig_output: str) -> list[str]:
     # Also catch interfaces that show "no wireless extensions" skip;
     # iwconfig lists wireless ones with IEEE 802.11.
     return sorted(set(found))
+
+
+def parse_iw_interfaces(iw_dev_output: str) -> list[str]:
+    """Return all interface names from `iw dev` output."""
+    return sorted(
+        {
+            m.group(1).strip()
+            for m in IW_DEV_BLOCK_RE.finditer(iw_dev_output or "")
+            if m.group(1).strip()
+        }
+    )
 
 
 def parse_ip_link_wireless_hint(ip_link_output: str) -> list[str]:

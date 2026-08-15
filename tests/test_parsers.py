@@ -29,6 +29,19 @@ eth0      no wireless extensions.
 """
         self.assertEqual(parse_wireless_interfaces(out), ["wlan0"])
 
+    def test_iw_dev_ifaces(self) -> None:
+        from app.core.parsers import parse_iw_interfaces
+
+        out = """phy#0
+	Interface wlan0
+		ifindex 10
+		type managed
+	Interface wlan0mon
+		ifindex 11
+		type monitor
+"""
+        self.assertEqual(parse_iw_interfaces(out), ["wlan0", "wlan0mon"])
+
     def test_airodump_csv(self) -> None:
         aps, stas = parse_airodump_csv(SAMPLE_CSV)
         self.assertEqual(len(aps), 1)

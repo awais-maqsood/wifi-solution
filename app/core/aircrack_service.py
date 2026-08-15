@@ -75,21 +75,127 @@ class AircrackService:
 
     # ------------------------------------------------------------- interfaces
     def list_interfaces(self) -> list[str]:
-        code, out = self._helper.run_capture(["iwconfig"])
-        ifaces = parsers.parse_wireless_interfaces(out)
-        if not ifaces:
-            code2, out2 = self._helper.run_capture(["ip", "link", "show"])
-            ifaces = parsers.parse_ip_link_wireless_hint(out2)
-            if code2 != 0 and not ifaces:
-                self._emit(out2.strip() or "Failed to list interfaces via ip link")
-        if code != 0 and "no wireless extensions" not in out.lower() and not ifaces:
-            # iwconfig exits non-zero sometimes when some ifaces lack wireless
+        """Discover wireless ifaces via iwconfig, iw, airmon-ng, ip, and sysfs."""
+        found: set[str] = set()
+
+        _c, iwc = self._helper.run_capture(["iwconfig"])
+        found.update(parsers.parse_wireless_interfaces(iwc or ""))
+
+        _c, iw_out = self._helper.run_capture(["iw", "dev"])
+        found.update(parsers.parse_iw_interfaces(iw_out or ""))
+
+        _c, airmon = self._helper.run_capture(["airmon-ng"])
+        for line in (airmon or "").splitlines():
+            parts = re.split(r"\t+|\s{2,}", line.strip())
+            if len(parts) < 2:
+                continue
+            if not parts[0].lower().startswith("phy"):
+                continue
+            if parts[0].strip().upper() == "PHY":
+                continue
+            iface = parts[1].strip()
+            if iface and iface.lower() not in ("interface", "driver", "chipset"):
+                found.add(iface)
+
+        _c, ip_out = self._helper.run_capture(["ip", "link", "show"])
+        found.update(parsers.parse_ip_link_wireless_hint(ip_out or ""))
+
+        # sysfs: any netdev with a wireless/phy80211 node
+        try:
+            net = Path("/sys/class/net")
+            if net.is_dir():
+                for entry in net.iterdir():
+                    name = entry.name
+                    if (entry / "wireless").exists() or (entry / "phy80211").exists():
+                        found.add(name)
+        except OSError:
             pass
-        # Include current monitor iface if known
+
         mon = self.session.monitor_interface
-        if mon and mon not in ifaces:
-            ifaces.append(mon)
-        return sorted(set(ifaces))
+        if mon:
+            found.add(mon)
+
+        # Drop obvious non-ifaces
+        return sorted(
+            n
+            for n in found
+            if n
+            and not n.startswith("(")
+            and n.lower() not in ("interface", "driver", "chipset")
+        )
+
+    def probe_adapter_status(self) -> dict:
+        """Explain why Interface may be empty even when USB Wi-Fi is plugged in."""
+        ifaces = self.list_interfaces()
+        _c, lsusb = self._helper.run_capture(["lsusb"], timeout=10)
+        usb_lines = []
+        for line in (lsusb or "").splitlines():
+            low = line.lower()
+            if any(
+                k in low
+                for k in (
+                    "wireless",
+                    "802.11",
+                    "realtek",
+                    "ralink",
+                    "atheros",
+                    "0bda:",
+                    "2357:",
+                    "148f:",
+                    "0cf3:",
+                )
+            ):
+                if "root hub" in low or "virtualbox" in low:
+                    continue
+                usb_lines.append(line.strip())
+
+        loaded: list[str] = []
+        _c, lsmod = self._helper.run_capture(["lsmod"], timeout=8)
+        for mod in (
+            "8188eu",
+            "8192eu",
+            "rtl8xxxu",
+            "r8188eu",
+            "88XXau",
+            "8812au",
+            "mac80211",
+        ):
+            if re.search(rf"^{re.escape(mod)}\b", lsmod or "", re.M):
+                loaded.append(mod)
+
+        return {
+            "ifaces": ifaces,
+            "usb": usb_lines,
+            "modules": loaded,
+            "has_usb": bool(usb_lines),
+            "has_iface": bool(ifaces),
+        }
+
+    def try_bring_up_wifi(self) -> list[str]:
+        """Best-effort: unblock rfkill, modprobe common Realtek modules, return ifaces."""
+        notes: list[str] = []
+        self._helper.run_capture(["rfkill", "unblock", "all"], timeout=10)
+        notes.append("rfkill unblock all")
+
+        # Prefer good DKMS modules; unload known-bad stock first when present
+        for bad in ("rtl8xxxu", "r8188eu"):
+            code, _ = self._helper.run_capture(["rmmod", bad], timeout=15)
+            if code == 0:
+                notes.append(f"rmmod {bad}")
+
+        for mod in ("8188eu", "8192eu", "88XXau", "8812au"):
+            code, out = self._helper.run_capture(["modprobe", mod], timeout=20)
+            if code == 0:
+                notes.append(f"modprobe {mod} ok")
+            elif out and "not found" not in (out or "").lower():
+                notes.append(f"modprobe {mod}: {(out or '').strip()[:120]}")
+
+        time.sleep(1.5)
+        ifaces = self.list_interfaces()
+        for iface in ifaces:
+            self._helper.run_capture(["ip", "link", "set", iface, "up"], timeout=8)
+            notes.append(f"ip link set {iface} up")
+        return notes
 
     # ----------------------------------------------------------- monitor mode
     # ----------------------------------------------------------- monitor mode
