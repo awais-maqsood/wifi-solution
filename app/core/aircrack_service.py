@@ -172,26 +172,72 @@ class AircrackService:
         }
 
     def try_bring_up_wifi(self) -> list[str]:
-        """Best-effort: unblock rfkill, modprobe common Realtek modules, return ifaces."""
+        """Install missing Realtek DKMS if needed, modprobe, USB rebind, bring ifaces up."""
+        from app.core.driver_service import DriverService
+
         notes: list[str] = []
+        drivers = DriverService(log=self._emit)
+
         self._helper.run_capture(["rfkill", "unblock", "all"], timeout=10)
         notes.append("rfkill unblock all")
 
-        # Prefer good DKMS modules; unload known-bad stock first when present
-        for bad in ("rtl8xxxu", "r8188eu"):
-            code, _ = self._helper.run_capture(["rmmod", bad], timeout=15)
-            if code == 0:
-                notes.append(f"rmmod {bad}")
+        probe = self.probe_adapter_status()
+        usb_blob = " ".join(probe["usb"])
+        profile = drivers.profile_for_usb_blob(usb_blob) if usb_blob else None
 
-        for mod in ("8188eu", "8192eu", "88XXau", "8812au"):
-            code, out = self._helper.run_capture(["modprobe", mod], timeout=20)
-            if code == 0:
-                notes.append(f"modprobe {mod} ok")
-            elif out and "not found" not in (out or "").lower():
-                notes.append(f"modprobe {mod}: {(out or '').strip()[:120]}")
+        need_install = False
+        if profile:
+            if not drivers.module_loaded(profile.good_module):
+                need_install = True
+                notes.append(
+                    f"Module '{profile.good_module}' not loaded — installing "
+                    f"{profile.install_label}…"
+                )
+        elif probe["has_usb"] and not probe["has_iface"]:
+            notes.append(
+                "USB Wi-Fi present but no known driver profile matched. "
+                "Open Drivers and Install manually."
+            )
 
-        time.sleep(1.5)
+        if need_install and profile:
+            if not self.is_root():
+                notes.append("Root required to install drivers.")
+                return notes
+            code = drivers.install_profile_blocking(profile)
+            notes.append(
+                f"Driver install exit={code} ({profile.install_label})"
+            )
+            if code != 0:
+                notes.append(
+                    "Driver install failed — check log / enable Kali contrib, "
+                    "or run: apt install realtek-rtl8188eus-dkms"
+                )
+                return notes
+        else:
+            # Prefer good DKMS modules; unload known-bad stock first when present
+            for bad in ("rtl8xxxu", "r8188eu"):
+                code, _ = self._helper.run_capture(["rmmod", bad], timeout=15)
+                if code == 0:
+                    notes.append(f"rmmod {bad}")
+
+            for mod in ("8188eu", "8192eu", "88XXau", "8812au"):
+                code, out = self._helper.run_capture(["modprobe", mod], timeout=20)
+                if code == 0:
+                    notes.append(f"modprobe {mod} ok")
+                else:
+                    err = (out or "").strip() or f"exit {code}"
+                    notes.append(f"modprobe {mod} failed: {err[:160]}")
+
+            if profile:
+                drivers.rebind_usb_ids(profile.usb_id_patterns)
+
+        time.sleep(2.0)
         ifaces = self.list_interfaces()
+        if not ifaces:
+            notes.append(
+                "Still no wlan iface after install/modprobe. "
+                "Unplug/replug USB (VirtualBox: Devices → USB → re-attach), then Refresh."
+            )
         for iface in ifaces:
             self._helper.run_capture(["ip", "link", "set", iface, "up"], timeout=8)
             notes.append(f"ip link set {iface} up")

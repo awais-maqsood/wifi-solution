@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -113,9 +114,14 @@ PROFILES: list[DriverProfile] = [
         good_module="8188eu",
         apt_package="realtek-rtl8188eus-dkms",
         blacklist_modules=["r8188eu", "rtl8xxxu"],
+        # apt first; git fallback if package missing / contrib not enabled
+        git_url="https://github.com/aircrack-ng/rtl8188eus.git",
+        dkms_name="rtl8188eus",
+        dkms_version="5.3.9",
         notes=(
             "Stock rtl8xxxu often reports monitor mode but captures 0 APs. "
-            "Install realtek-rtl8188eus-dkms and blacklist rtl8xxxu."
+            "Install realtek-rtl8188eus-dkms (Kali contrib) or git DKMS, "
+            "blacklist rtl8xxxu, then unplug/replug."
         ),
     ),
     DriverProfile(
@@ -557,12 +563,22 @@ class DriverService:
                     code = self._install_git_dkms(profile, on_line=on_line)
                 else:
                     code = self._install_apt(profile, on_line=on_line)
+                    if code != 0 and profile.git_url:
+                        self._emit(
+                            "apt install failed — trying git DKMS fallback "
+                            f"({profile.git_url})…"
+                        )
+                        code = self._install_git_dkms(profile, on_line=on_line)
                 if code == 0:
                     self.ensure_blacklist(profile.blacklist_modules)
                     self.reload_modules(profile)
+                    rebound = self.rebind_usb_ids(profile.usb_id_patterns)
+                    if rebound:
+                        self._emit(f"USB rebind attempted for: {', '.join(rebound)}")
                     self._emit(
                         f"Install finished ({profile.install_label}). "
-                        "Unplug/replug the adapter (or reboot), then Verify again."
+                        "If still no wlan iface: unplug/replug the adapter "
+                        "(VirtualBox: Devices → USB → re-attach), then Verify."
                     )
             except Exception as exc:
                 self._emit(f"Install error: {exc}")
@@ -574,10 +590,89 @@ class DriverService:
 
         threading.Thread(target=_run, daemon=True).start()
 
+    def install_profile_blocking(
+        self,
+        profile: DriverProfile,
+        *,
+        on_line: Optional[OnLine] = None,
+    ) -> int:
+        """Install on the current thread (for Bring-up / automation)."""
+        if self.installing:
+            self._emit("Install already running.")
+            return 1
+        if not self.is_root():
+            self._emit("Root required. Run via ./run.sh")
+            return 1
+        self._installing = True
+        code = 1
+        try:
+            if profile.install_method == "git_dkms":
+                code = self._install_git_dkms(profile, on_line=on_line)
+            else:
+                code = self._install_apt(profile, on_line=on_line)
+                if code != 0 and profile.git_url:
+                    self._emit("apt install failed — trying git DKMS fallback…")
+                    code = self._install_git_dkms(profile, on_line=on_line)
+            if code == 0:
+                self.ensure_blacklist(profile.blacklist_modules)
+                self.reload_modules(profile)
+                rebound = self.rebind_usb_ids(profile.usb_id_patterns)
+                if rebound:
+                    self._emit(f"USB rebind attempted for: {', '.join(rebound)}")
+                self._emit(f"Install finished ({profile.install_label}).")
+        except Exception as exc:
+            self._emit(f"Install error: {exc}")
+            code = 1
+        finally:
+            self._installing = False
+        return code
+
+    def profile_for_usb_blob(self, blob: str) -> Optional[DriverProfile]:
+        return self._match_profile(blob)
+
+    def rebind_usb_ids(self, usb_id_patterns: list[str]) -> list[str]:
+        """Soft re-plug: unbind/bind matching USB devices under /sys."""
+        rebound: list[str] = []
+        usb_root = Path("/sys/bus/usb/devices")
+        if not usb_root.is_dir():
+            return rebound
+        wanted = {p.lower() for p in usb_id_patterns}
+        try:
+            for dev in usb_root.iterdir():
+                vend = dev / "idVendor"
+                prod = dev / "idProduct"
+                if not vend.exists() or not prod.exists():
+                    continue
+                try:
+                    uid = f"{vend.read_text().strip()}:{prod.read_text().strip()}".lower()
+                except OSError:
+                    continue
+                if uid not in wanted:
+                    continue
+                name = dev.name  # e.g. 1-2
+                unbind = Path("/sys/bus/usb/drivers/usb/unbind")
+                bind = Path("/sys/bus/usb/drivers/usb/bind")
+                try:
+                    if unbind.exists():
+                        unbind.write_text(name)
+                        self._emit(f"USB unbind {name} ({uid})")
+                    time.sleep(1.0)
+                    if bind.exists():
+                        bind.write_text(name)
+                        self._emit(f"USB bind {name} ({uid})")
+                    rebound.append(f"{name}/{uid}")
+                except OSError as exc:
+                    self._emit(f"USB rebind {name} failed: {exc}")
+        except OSError as exc:
+            self._emit(f"USB rebind scan failed: {exc}")
+        return rebound
+
     def _install_apt(
         self, profile: DriverProfile, *, on_line: Optional[OnLine]
     ) -> int:
         kernel = os.uname().release
+        # Package may live in Kali contrib — make sure apt can see it
+        self._ensure_package_visible(profile.apt_package, on_line=on_line)
         cmds = [
             ["apt-get", "update"],
             [
@@ -586,6 +681,7 @@ class DriverService:
                 "-y",
                 "dkms",
                 "build-essential",
+                "git",
                 f"linux-headers-{kernel}",
                 profile.apt_package,
             ],
@@ -594,8 +690,55 @@ class DriverService:
             code = self._run_logged(cmd, on_line=on_line)
             if code != 0:
                 self._emit(f"Command failed ({code}): {' '.join(cmd)}")
+                if profile.apt_package in " ".join(cmd):
+                    self._emit(
+                        "Hint: enable Kali contrib in /etc/apt/sources.list "
+                        "(main contrib non-free non-free-firmware), then retry — "
+                        "or the app will try git DKMS next."
+                    )
                 return code
         return 0
+
+    def _ensure_package_visible(
+        self, package: str, *, on_line: Optional[OnLine]
+    ) -> None:
+        if not package:
+            return
+        code, out = self._helper.run_capture(
+            ["apt-cache", "policy", package], timeout=15
+        )
+        text = out or ""
+        if code == 0 and "Candidate:" in text and "(none)" not in text.split("Candidate:")[-1][:40]:
+            return
+        self._emit(
+            f"Package '{package}' not visible to apt — checking sources for contrib…"
+        )
+        sources = Path("/etc/apt/sources.list")
+        try:
+            raw = sources.read_text(encoding="utf-8", errors="replace") if sources.exists() else ""
+        except OSError:
+            return
+        changed = False
+        lines = raw.splitlines()
+        new_lines: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("deb ") and "kali" in stripped.lower():
+                if "contrib" not in stripped:
+                    line = line.rstrip() + " contrib"
+                    changed = True
+                if "non-free" not in stripped:
+                    line = line.rstrip() + " non-free non-free-firmware"
+                    changed = True
+            new_lines.append(line)
+        if changed:
+            try:
+                sources.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+                self._emit(f"Updated {sources} to include contrib/non-free")
+                if on_line:
+                    on_line(f"Updated {sources} to include contrib/non-free")
+            except OSError as exc:
+                self._emit(f"Could not update sources.list: {exc}")
 
     def _install_git_dkms(
         self, profile: DriverProfile, *, on_line: Optional[OnLine]

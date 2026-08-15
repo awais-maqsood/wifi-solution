@@ -37,8 +37,8 @@ class InterfacePage(PageBase):
         )
         ctk.CTkButton(
             btn_row,
-            text="Bring up adapter",
-            width=140,
+            text="Fix adapter (install driver)",
+            width=200,
             command=self.bring_up,
         ).pack(side="left", padx=(0, 8))
         ctk.CTkButton(
@@ -112,8 +112,8 @@ class InterfacePage(PageBase):
             msg = (
                 f"USB Wi-Fi is plugged in ({usb_short}), but Linux has not created "
                 f"a network interface (wlan0) yet. Loaded modules: {mods}. "
-                "Click Bring up adapter, or Drivers → Install recommended → "
-                "Blacklist + reload → unplug/replug the stick."
+                "Click Fix adapter (install driver) — this installs "
+                "realtek-rtl8188eus-dkms / git DKMS, blacklists rtl8xxxu, and rebinds USB."
             )
             self.hint.configure(text=msg)
             self.app.log(
@@ -140,8 +140,10 @@ class InterfacePage(PageBase):
             self.app.log("No wireless USB devices and no wlan interfaces found.")
 
     def bring_up(self) -> None:
-        self.status.configure(text="Trying modprobe / rfkill…")
-        self.app.log("Bring up adapter: rfkill + modprobe common Wi-Fi drivers…")
+        self.status.configure(text="Installing driver / bringing up…")
+        self.app.log(
+            "Fix adapter: install DKMS if needed, modprobe, USB rebind…"
+        )
 
         def _worker() -> None:
             try:
@@ -149,7 +151,7 @@ class InterfacePage(PageBase):
                 for n in notes:
                     self.app.log(n)
             except Exception as exc:
-                self.app.log(f"Bring up failed: {exc}")
+                self.app.log(f"Fix adapter failed: {exc}")
             self.ui(self.refresh)
 
         import threading
